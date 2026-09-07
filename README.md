@@ -1,6 +1,35 @@
 # AUTONOMA ($AUTO)
 > Deterministic, Self-Executing Token-2022 State Machine on Solana.
 
+
+# AUTONOMA Protocol: Invariant Specification & Falsification Suite
+
+This repository contains the candidate configuration and verification tests for the AUTONOMA ($AUTO) Token-2022 deployment on Solana.
+
+The objective of AUTONOMA is achieving a **Human Control Surface (HCS) of zero** at Block Zero.
+
+## The Invariants
+
+1. **$I_1$ (Supply Ceiling):** Supply is permanently fixed. Mint authority is revoked at Block Zero.
+2. **$I_2$ (Transfer Immunity):** Freeze authority is revoked. No actor retains account-freezing capabilities.
+3. **$I_3$ (Confiscation Immunity):** Permanent delegate extensions are explicitly disabled.
+4. **$I_4$ (Inventory Neutrality):** Deployer balance = 0.00%. Private allocation = 0.00%.
+5. **$I_5$ (MEV Resistance):** Sub-scale initialization enforces high-slippage penalties on predatory bundle extractors.
+
+---
+
+## Adversarial Challenge: Falsify the Directive
+
+We invite security researchers, Solana developers, and auditors to review the configuration.
+
+If you can construct a valid transaction sequence demonstrating that a privileged authority survives Block Zero or can violate invariants $I_1 - I_5$, submit a detailed issue report.
+
+Valid findings will be formally entered into the public security record, and contributors will be invited to the protocol's independent Advisory Board.
+
+
+
+
+
 ---
 
 ## 1. Overview
