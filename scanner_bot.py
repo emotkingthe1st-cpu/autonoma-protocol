@@ -3,10 +3,23 @@ import json
 import urllib.request
 import urllib.parse
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Henter token fra environment eller direkte fallback
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8668397480:AAGIdyV9KaiCAu7CaVACcMh-IZezsVBHIiA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8660593861:AAEbPMr5FqblDP6Gb1KSELvyBNWE4IBppEU")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
+# Dummy webserver så Render Free Tier holder servicen i live gratis
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"AUTONOMA HCS SCANNER ACTIVE")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 def get_token_info(mint_address):
     payload = {
@@ -30,8 +43,7 @@ def get_token_info(mint_address):
                 "mint_auth": info.get("mintAuthority"),
                 "freeze_auth": info.get("freezeAuthority")
             }
-    except Exception as e:
-        print(f"Solana RPC Error: {e}")
+    except Exception:
         return None
 
 def send_message(chat_id, text):
@@ -47,9 +59,9 @@ def send_message(chat_id, text):
         req = urllib.request.Request(url, data=data)
         urllib.request.urlopen(req)
     except Exception as e:
-        print(f"Telegram Send Error: {e}")
+        print(f"Send error: {e}")
 
-def main():
+def bot_loop():
     print("🛡️ AUTONOMA HCS Scanner Engine Active...")
     offset = 0
     while True:
@@ -94,8 +106,12 @@ def main():
 <i>Audited via AUTONOMA Protocol // autonomaprotocol.io</i>
 """
                     send_message(chat_id, report.strip())
-        except Exception as e:
+        except Exception:
             time.sleep(3)
 
 if __name__ == "__main__":
-    main()
+    # Start dummy port i baggrundstråd
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    # Kør Telegram scanner-motoren
+    bot_loop()
