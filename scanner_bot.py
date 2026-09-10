@@ -5,7 +5,7 @@ import asyncio
 from typing import Dict, Any, Optional, List
 
 from aiohttp import web, ClientSession, ClientTimeout, ClientError
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -27,7 +27,7 @@ logger = logging.getLogger("AutonomaHcsScanner")
 # ------------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8660593861:AAEbPMr5FqblDP6Gb1KSELvyBNWE4IBppEU")
 PORT = int(os.environ.get("PORT", 8080))
-RPC_TIMEOUT_SECONDS = 2.5
+RPC_TIMEOUT_SECONDS = 3.0
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 # Primary, Secondary, Tertiary RPC Fallback Chain
@@ -39,12 +39,12 @@ RPC_ENDPOINTS: List[str] = [
 ]
 
 # ------------------------------------------------------------------------------
-# ASYNC SOLANA RPC TOKEN AUDIT ENGINE
+# ASYNC SOLANA RPC & DEXSCREENER DATA ENGINE
 # ------------------------------------------------------------------------------
 async def fetch_token_account_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
     """
     Asynchronously queries Solana getAccountInfo using aiohttp with aggressive timeout
-    (max 2.5 seconds per node) and automatic RPC node fallback chaining.
+    (max 3.0 seconds per node) and automatic RPC node fallback chaining.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -136,9 +136,111 @@ async def fetch_token_account_info(session: ClientSession, mint_address: str) ->
     }
 
 
-def generate_audit_report(ca: str, audit_res: Dict[str, Any]) -> str:
+async def fetch_dexscreener_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
     """
-    Formats the HCS Audit Report as clean HTML for Telegram display.
+    Asynchronously queries DexScreener API for token price, FDV/market cap, 24h change, and pair URL.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address.strip()}"
+    headers = {"User-Agent": "AutonomaHcsBot/1.0"}
+    timeout = ClientTimeout(total=RPC_TIMEOUT_SECONDS)
+
+    try:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                pairs = data.get("pairs")
+                if pairs and isinstance(pairs, list) and len(pairs) > 0:
+                    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                    target_pairs = solana_pairs if solana_pairs else pairs
+                    best_pair = max(
+                        target_pairs,
+                        key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0)
+                    )
+                    base_token = best_pair.get("baseToken", {})
+                    price_usd = best_pair.get("priceUsd")
+                    fdv = best_pair.get("fdv")
+                    market_cap = best_pair.get("marketCap")
+                    price_change_24h = best_pair.get("priceChange", {}).get("h24")
+                    pair_url = best_pair.get("url")
+
+                    return {
+                        "found": True,
+                        "name": base_token.get("name"),
+                        "symbol": base_token.get("symbol"),
+                        "price_usd": price_usd,
+                        "fdv": fdv or market_cap,
+                        "price_change_24h": price_change_24h,
+                        "pair_url": pair_url
+                    }
+    except Exception as e:
+        logger.warning(f"DexScreener API fetch warning: {e}")
+
+    return {
+        "found": False,
+        "name": None,
+        "symbol": None,
+        "price_usd": None,
+        "fdv": None,
+        "price_change_24h": None,
+        "pair_url": None
+    }
+
+
+def format_market_cap(val: Any) -> str:
+    if val is None:
+        return "N/A"
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return "N/A"
+
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.2f}B"
+    elif v >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    elif v >= 1_000:
+        return f"${v / 1_000:.1f}K"
+    else:
+        return f"${v:.2f}"
+
+
+def format_price(val: Any) -> str:
+    if val is None:
+        return "N/A"
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return "N/A"
+
+    if v >= 1.0:
+        return f"${v:.2f}"
+    elif v >= 0.01:
+        return f"${v:.4f}"
+    elif v > 0:
+        s = f"${v:.8f}".rstrip("0")
+        return s if not s.endswith(".") else s + "00"
+    return "$0.00"
+
+
+def format_price_change(val: Any) -> str:
+    if val is None:
+        return "N/A"
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return "N/A"
+
+    if v > 0:
+        return f"+{v:.2f}% 📈"
+    elif v < 0:
+        return f"{v:.2f}% 📉"
+    else:
+        return "0.00% ➡️"
+
+
+def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str, Any]) -> str:
+    """
+    Formats the HCS Audit Report with DexScreener metrics & HCS Verdict as clean HTML for Telegram display.
     """
     if not audit_res.get("found"):
         err_msg = audit_res.get("error", "Address not found on Mainnet-Beta or invalid CA.")
@@ -147,27 +249,60 @@ def generate_audit_report(ca: str, audit_res: Dict[str, Any]) -> str:
     is_token_2022 = audit_res.get("is_token_2022", False)
     mint_auth = audit_res.get("mint_auth")
     freeze_auth = audit_res.get("freeze_auth")
-
     is_clean = (mint_auth is None) and (freeze_auth is None)
-    program_type = "Token-2022" if is_token_2022 else "Legacy SPL"
 
-    if is_clean:
-        verdict = "🟢 <b>ZERO HUMAN CONTROL (0% HCS)</b>"
+    name = dex_res.get("name")
+    symbol = dex_res.get("symbol")
+    if name and symbol:
+        token_title = f"{name} (${symbol})"
+    elif symbol:
+        token_title = f"${symbol}"
     else:
-        verdict = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
+        token_title = "Unlisted / Pre-Launch"
+
+    price_str = format_price(dex_res.get("price_usd"))
+    mc_str = format_market_cap(dex_res.get("fdv"))
+    change_str = format_price_change(dex_res.get("price_change_24h"))
+
+    program_type = "Token-2022" if is_token_2022 else "Legacy SPL"
 
     mint_status = "✅ REVOKED (0 Expansion)" if mint_auth is None else "❌ RETAINED (Inflation Risk)"
     freeze_status = "✅ REVOKED (Permissionless)" if freeze_auth is None else "❌ RETAINED (Blacklist Risk)"
 
+    if is_clean:
+        grade_str = "🏆 <b>GRADE: A+ (IMMUTABLE)</b>"
+        verdict_str = "🟢 <b>ZERO HUMAN CONTROL (0% HCS)</b>"
+        explanation = (
+            "<b>🟢 WHY THIS IS SAFE:</b>\n"
+            "• <b>Zero Dilution:</b> Supply is locked forever. No dev can inflate or dump new tokens.\n"
+            "• <b>100% Sovereign:</b> Nobody owns a master freeze key. Wallets cannot be blacklisted or locked."
+        )
+    else:
+        grade_str = "⚠️ <b>GRADE: D- (CENTRALIZED RISK)</b>"
+        verdict_str = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
+        explanation = (
+            "<b>🔴 CRITICAL RISKS DETECTED:</b>\n"
+            "• <b>Dilution / Blacklist Hazard:</b> Surviving founder permissions allow supply alteration or wallet freezing."
+        )
+
     report = (
         f"🛡️ <b>AUTONOMA HCS RUNTIME REPORT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Token:</b> {token_title}\n"
         f"<b>Target CA:</b> <code>{ca}</code>\n"
         f"<b>Program:</b> {program_type}\n\n"
+        f"📊 <b>MARKET METRICS:</b>\n"
+        f"• <b>Price:</b> {price_str}\n"
+        f"• <b>FDV / Market Cap:</b> {mc_str}\n"
+        f"• <b>24h Change:</b> {change_str}\n\n"
+        f"🔒 <b>AUTHORITY STATUS:</b>\n"
         f"• <b>Mint Authority:</b> {mint_status}\n"
         f"• <b>Freeze Authority:</b> {freeze_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>VERDICT:</b> {verdict}\n\n"
+        f"{grade_str}\n"
+        f"<b>VERDICT:</b> {verdict_str}\n\n"
+        f"{explanation}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Audited via AUTONOMA Protocol // autonomaprotocol.io</i>"
     )
     return report
@@ -213,7 +348,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles /scan <CA> and /scan@AutonomaHcsBot <CA> non-blockingly.
-    Sends instant temporary status message and edits it when RPC results are ready.
+    Performs parallel fetching of Solana RPC account info & DexScreener market data.
+    Sends instant status update and edits with final HCS Audit Report + inline buttons.
     """
     if not update.message:
         return
@@ -242,17 +378,41 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             created_temp_session = True
 
         try:
-            # Step 3: Async Solana token RPC audit with fallback chain
-            audit_result = await fetch_token_account_info(session, ca)
+            # Step 3: Concurrently fetch Solana RPC account info & DexScreener token market metrics
+            audit_result, dex_result = await asyncio.gather(
+                fetch_token_account_info(session, ca),
+                fetch_dexscreener_info(session, ca),
+                return_exceptions=True
+            )
         finally:
             if created_temp_session:
                 await session.close()
 
-        # Step 4: Edit initial status message with audit report
-        report_text = generate_audit_report(ca, audit_result)
+        # Handle potential task exceptions gracefully
+        if isinstance(audit_result, Exception):
+            logger.error(f"Audit task exception: {audit_result}")
+            audit_result = {"success": False, "found": False, "error": "RPC call failed due to network exception."}
+
+        if isinstance(dex_result, Exception):
+            logger.warning(f"DexScreener task exception: {dex_result}")
+            dex_result = {"found": False}
+
+        # Step 4: Build Inline Keyboard with DexScreener & AUTONOMA Terminal buttons
+        keyboard = []
+        row = []
+        pair_url = dex_result.get("pair_url") if isinstance(dex_result, dict) else None
+        if pair_url:
+            row.append(InlineKeyboardButton("📈 DexScreener", url=pair_url))
+        row.append(InlineKeyboardButton("🌐 AUTONOMA Terminal", url="https://autonomaprotocol.io"))
+        keyboard.append(row)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Step 5: Edit initial status message with final audit report
+        report_text = generate_audit_report(ca, audit_result, dex_result)
         await status_msg.edit_text(
             report_text,
             parse_mode="HTML",
+            reply_markup=reply_markup,
             disable_web_page_preview=True
         )
 
