@@ -38,13 +38,134 @@ RPC_ENDPOINTS: List[str] = [
     "https://api.mainnet-beta.solana.com",
 ]
 
+# Known DEX Pool programs, authorities, and vault addresses to filter from Top 10 Holders
+KNOWN_LP_OWNERS = {
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # Raydium Authority V4
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium Pool V4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "CPMDWBwStZJaBHpyEfsj4X71vKLtvhkV26uD5A7V754",  # Raydium CPMM
+    "whirLMiicVdio4qvUfM5KAgZ5adqns8h5rxJe1mM84S",  # Orca Whirlpool
+    "9W959Dq1SC2t22n75Lzp5VJ5yLWw13QEbUBDjW55g24t",  # Orca Swap V2
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun Bonding Curve
+    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",  # Pump.fun Raydium Vault
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+    "Eo7WjKq67rjJQSZxS6z3YKapzY3eMj6Xy8X5EQVn5UaB",  # Meteora Pools
+    "MOONCVVNZFSYkqNXP6bxHLcC6xD5Yzn2KThEjGqqXuu",  # Moonshot
+}
+
 # ------------------------------------------------------------------------------
 # ASYNC SOLANA RPC & DEXSCREENER DATA ENGINE
 # ------------------------------------------------------------------------------
+async def fetch_token_largest_accounts(session: ClientSession, mint_address: str, total_supply_raw: int) -> Optional[float]:
+    """
+    Calls getTokenLargestAccounts to retrieve largest token accounts,
+    filters out known Raydium/Orca/Pump.fun LP pools, and calculates
+    the percentage of circulating supply held by Top 10 non-LP wallets.
+    """
+    if total_supply_raw <= 0:
+        return None
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenLargestAccounts",
+        "params": [
+            mint_address.strip(),
+            {"commitment": "confirmed"}
+        ]
+    }
+    headers = {"Content-Type": "application/json", "User-Agent": "AutonomaHcsBot/1.0"}
+    timeout = ClientTimeout(total=RPC_TIMEOUT_SECONDS)
+
+    endpoints = list(RPC_ENDPOINTS)
+    custom_rpc = os.environ.get("SOLANA_RPC")
+    if custom_rpc and custom_rpc not in endpoints:
+        endpoints.insert(0, custom_rpc)
+
+    for endpoint in endpoints:
+        try:
+            async with session.post(endpoint, json=payload, headers=headers, timeout=timeout) as resp:
+                if resp.status != 200:
+                    continue
+
+                data = await resp.json()
+                if not data or "result" not in data:
+                    continue
+
+                value = data["result"].get("value")
+                if not isinstance(value, list) or len(value) == 0:
+                    continue
+
+                candidate_addresses = []
+                for item in value:
+                    addr = item.get("address")
+                    try:
+                        amount = int(item.get("amount", 0))
+                    except (ValueError, TypeError):
+                        amount = 0
+                    if addr and amount > 0:
+                        candidate_addresses.append((addr, amount))
+
+                if not candidate_addresses:
+                    continue
+
+                # Batch inspect account owners using getMultipleAccounts
+                account_pubkeys = [c[0] for c in candidate_addresses]
+                multi_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getMultipleAccounts",
+                    "params": [
+                        account_pubkeys,
+                        {"encoding": "jsonParsed", "commitment": "confirmed"}
+                    ]
+                }
+
+                non_lp_amounts = []
+                try:
+                    async with session.post(endpoint, json=multi_payload, headers=headers, timeout=timeout) as multi_resp:
+                        if multi_resp.status == 200:
+                            multi_data = await multi_resp.json()
+                            multi_val = multi_data.get("result", {}).get("value", [])
+                            for idx, acc_info in enumerate(multi_val):
+                                addr, amt = candidate_addresses[idx]
+                                is_lp = False
+                                if addr in KNOWN_LP_OWNERS:
+                                    is_lp = True
+                                elif acc_info and isinstance(acc_info, dict):
+                                    owner = acc_info.get("owner", "")
+                                    parsed_owner = (
+                                        acc_info.get("data", {})
+                                        .get("parsed", {})
+                                        .get("info", {})
+                                        .get("owner", "")
+                                    )
+                                    if owner in KNOWN_LP_OWNERS or parsed_owner in KNOWN_LP_OWNERS:
+                                        is_lp = True
+
+                                if not is_lp:
+                                    non_lp_amounts.append(amt)
+                        else:
+                            non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in KNOWN_LP_OWNERS]
+                except Exception:
+                    non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in KNOWN_LP_OWNERS]
+
+                top10_sum = sum(non_lp_amounts[:10])
+                pct = (top10_sum / float(total_supply_raw)) * 100.0
+                return round(pct, 1)
+
+        except Exception as e:
+            logger.warning(f"getTokenLargestAccounts warning for endpoint {endpoint}: {e}")
+            continue
+
+    return None
+
+
 async def fetch_token_account_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
     """
     Asynchronously queries Solana getAccountInfo using aiohttp with aggressive timeout
     (max 3.0 seconds per node) and automatic RPC node fallback chaining.
+    Also fetches getTokenLargestAccounts to audit Privileged Inventory / Top 10 Holders.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -112,6 +233,14 @@ async def fetch_token_account_info(session: ClientSession, mint_address: str) ->
                 is_token_2022 = (owner == TOKEN_2022_PROGRAM_ID)
                 mint_auth = info.get("mintAuthority")
                 freeze_auth = info.get("freezeAuthority")
+                supply_raw_str = info.get("supply", "0")
+                try:
+                    total_supply_raw = int(supply_raw_str)
+                except (ValueError, TypeError):
+                    total_supply_raw = 0
+
+                # Asynchronously audit Top 10 Holders / Inventory Concentration
+                top10_pct = await fetch_token_largest_accounts(session, mint_address, total_supply_raw)
 
                 return {
                     "success": True,
@@ -119,7 +248,9 @@ async def fetch_token_account_info(session: ClientSession, mint_address: str) ->
                     "endpoint": endpoint,
                     "is_token_2022": is_token_2022,
                     "mint_auth": mint_auth,
-                    "freeze_auth": freeze_auth
+                    "freeze_auth": freeze_auth,
+                    "total_supply_raw": total_supply_raw,
+                    "top10_pct": top10_pct
                 }
 
         except (asyncio.TimeoutError, ClientError) as e:
@@ -240,7 +371,8 @@ def format_price_change(val: Any) -> str:
 
 def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str, Any]) -> str:
     """
-    Formats the HCS Audit Report with DexScreener metrics & HCS Verdict as clean HTML for Telegram display.
+    Formats the HCS Audit Report with DexScreener metrics, Top 10 Inventory Concentration,
+    and HCS Grade & Verdict as clean HTML for Telegram display.
     """
     if not audit_res.get("found"):
         err_msg = audit_res.get("error", "Address not found on Mainnet-Beta or invalid CA.")
@@ -249,7 +381,11 @@ def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str,
     is_token_2022 = audit_res.get("is_token_2022", False)
     mint_auth = audit_res.get("mint_auth")
     freeze_auth = audit_res.get("freeze_auth")
-    is_clean = (mint_auth is None) and (freeze_auth is None)
+    top10_pct = audit_res.get("top10_pct")
+
+    mint_clean = (mint_auth is None)
+    freeze_clean = (freeze_auth is None)
+    authorities_clean = mint_clean and freeze_clean
 
     name = dex_res.get("name")
     symbol = dex_res.get("symbol")
@@ -266,23 +402,40 @@ def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str,
 
     program_type = "Token-2022" if is_token_2022 else "Legacy SPL"
 
-    mint_status = "✅ REVOKED (0 Expansion)" if mint_auth is None else "❌ RETAINED (Inflation Risk)"
-    freeze_status = "✅ REVOKED (Permissionless)" if freeze_auth is None else "❌ RETAINED (Blacklist Risk)"
+    mint_status = "✅ REVOKED (0 Expansion)" if mint_clean else "❌ RETAINED (Inflation Risk)"
+    freeze_status = "✅ REVOKED (Permissionless)" if freeze_clean else "❌ RETAINED (Blacklist Risk)"
 
-    if is_clean:
-        grade_str = "🏆 <b>GRADE: A+ (IMMUTABLE)</b>"
-        verdict_str = "🟢 <b>ZERO HUMAN CONTROL (0% HCS)</b>"
-        explanation = (
-            "<b>🟢 WHY THIS IS SAFE:</b>\n"
-            "• <b>Zero Dilution:</b> Supply is locked forever. No dev can inflate or dump new tokens.\n"
-            "• <b>100% Sovereign:</b> Nobody owns a master freeze key. Wallets cannot be blacklisted or locked."
-        )
+    # Format Top 10 Holders Concentration Status
+    if top10_pct is not None:
+        if top10_pct > 20.0:
+            holders_status = f"⚠️ {top10_pct:.1f}% (High Dump Risk)"
+        else:
+            holders_status = f"✅ {top10_pct:.1f}% (Distributed)"
     else:
+        holders_status = "ℹ️ N/A"
+
+    # Determine HCS Grade & Safety Verdict based on Authorities + Inventory Concentration
+    if not authorities_clean:
         grade_str = "⚠️ <b>GRADE: D- (CENTRALIZED RISK)</b>"
         verdict_str = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
         explanation = (
             "<b>🔴 CRITICAL RISKS DETECTED:</b>\n"
             "• <b>Dilution / Blacklist Hazard:</b> Surviving founder permissions allow supply alteration or wallet freezing."
+        )
+    elif top10_pct is not None and top10_pct > 20.0:
+        grade_str = "⚠️ <b>GRADE: C- (CABAL CONCENTRATION RISK)</b>"
+        verdict_str = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
+        explanation = (
+            "<b>⚠️ CABAL CONCENTRATION RISK DETECTED:</b>\n"
+            "• <b>High Insider Control:</b> Top 10 non-LP wallets control > 20% of circulating supply, creating severe dump and price manipulation hazard."
+        )
+    else:
+        grade_str = "🏆 <b>GRADE: A+ (IMMUTABLE & DECENTRALIZED)</b>"
+        verdict_str = "🟢 <b>ZERO HUMAN CONTROL (0% HCS)</b>"
+        explanation = (
+            "<b>🟢 WHY THIS IS SAFE:</b>\n"
+            "• <b>Zero Dilution:</b> Supply is locked forever. No dev can inflate or dump new tokens.\n"
+            "• <b>100% Sovereign:</b> Nobody owns a master freeze key. Wallets cannot be blacklisted or locked."
         )
 
     report = (
@@ -295,9 +448,10 @@ def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str,
         f"• <b>Price:</b> {price_str}\n"
         f"• <b>FDV / Market Cap:</b> {mc_str}\n"
         f"• <b>24h Change:</b> {change_str}\n\n"
-        f"🔒 <b>AUTHORITY STATUS:</b>\n"
+        f"🔒 <b>AUTHORITY & INVENTORY STATUS:</b>\n"
         f"• <b>Mint Authority:</b> {mint_status}\n"
         f"• <b>Freeze Authority:</b> {freeze_status}\n"
+        f"• <b>Top 10 Holders:</b> {holders_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{grade_str}\n"
         f"<b>VERDICT:</b> {verdict_str}\n\n"
@@ -334,7 +488,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         msg = (
             "ℹ️ <b>AUTONOMA HCS Scanner Help</b>\n\n"
-            "Check whether a Solana token has revoked mint and freeze authorities.\n\n"
+            "Check whether a Solana token has revoked mint/freeze authorities and audit Top 10 insider holder concentration.\n\n"
             "<b>Commands:</b>\n"
             "<code>/scan &lt;SOLANA_CA&gt;</code>\n"
             "<code>/scan@AutonomaHcsBot &lt;SOLANA_CA&gt;</code>\n\n"
@@ -366,7 +520,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Step 1: Send instant status message to notify user immediately
         status_msg = await update.message.reply_text(
-            "🔍 <i>Auditing Human Control Surface...</i>",
+            "🔍 <i>Auditing Human Control Surface & Top 10 Inventory...</i>",
             parse_mode="HTML"
         )
 
