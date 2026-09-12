@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List, Set
 
 from aiohttp import ClientSession, ClientTimeout, ClientError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, Conflict
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -634,8 +634,15 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 async def post_init(application: Application) -> None:
     """
     Lifecycle hook called when Telegram Application is initialized.
-    Sets up shared aiohttp ClientSession for non-blocking network calls.
+    1. Resets webhooks and drops pending updates to resolve 409 Conflict on zero-downtime deploys.
+    2. Initializes shared aiohttp ClientSession for non-blocking RPC network calls.
     """
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Cleared previous Telegram webhooks and dropped pending updates")
+    except Exception as e:
+        logger.warning(f"delete_webhook warning in post_init: {e}")
+
     session = ClientSession()
     application.bot_data["http_session"] = session
     logger.info("Initialized shared aiohttp ClientSession")
@@ -686,7 +693,7 @@ def main():
     # 4. Register global error handler
     application.add_error_handler(global_error_handler)
 
-    # 5. Start robust Telegram polling loop with auto-retry on network glitches
+    # 5. Start robust Telegram polling loop with auto-retry on network glitches & conflict resolution
     logger.info("Bot starting polling loop...")
     application.run_polling(
         poll_interval=1.0,
