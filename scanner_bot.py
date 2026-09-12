@@ -2,10 +2,13 @@ import os
 import sys
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional, List, Set
 
-from aiohttp import web, ClientSession, ClientTimeout, ClientError
+from aiohttp import ClientSession, ClientTimeout, ClientError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -52,6 +55,30 @@ KNOWN_LP_OWNERS: Set[str] = {
     "Eo7WjKq67rjJQSZxS6z3YKapzY3eMj6Xy8X5EQVn5UaB",  # Meteora Pools
     "MOONCVVNZFSYkqNXP6bxHLcC6xD5Yzn2KThEjGqqXuu",  # Moonshot
 }
+
+# ------------------------------------------------------------------------------
+# RENDER HEALTH CHECK DUMMY HTTP SERVER (BACKGROUND THREAD)
+# ------------------------------------------------------------------------------
+class HealthHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler to satisfy Render Web Service health checks."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"AUTONOMA HCS SCANNER ACTIVE")
+
+    def log_message(self, format, *args):
+        pass  # Suppress standard HTTP logs to keep console output clean
+
+
+def run_health_server():
+    """Runs a lightweight HTTP health check server in a background daemon thread."""
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info(f"🌐 Render Health Check HTTP server listening on 0.0.0.0:{PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Error in health check server: {e}")
 
 # ------------------------------------------------------------------------------
 # DUAL-LOOKUP PIPELINE: DEXSCREENER & SOLANA RPC
@@ -602,78 +629,71 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.error(f"Unhandled exception caught by global handler: {context.error}", exc_info=context.error)
 
 # ------------------------------------------------------------------------------
-# RENDER HEALTH CHECK WEBSERVER & APPLICATION LIFECYCLE
+# APPLICATION LIFECYCLE HOOKS
 # ------------------------------------------------------------------------------
 async def post_init(application: Application) -> None:
     """
     Lifecycle hook called when Telegram Application is initialized.
-    Sets up shared aiohttp ClientSession and starts aiohttp web server for Render health checks.
+    Sets up shared aiohttp ClientSession for non-blocking network calls.
     """
-    # 1. Initialize persistent ClientSession for async RPC requests
     session = ClientSession()
     application.bot_data["http_session"] = session
-
-    # 2. Setup aiohttp web server for Render HTTP health check on PORT
-    web_app = web.Application()
-
-    async def handle_health_check(request: web.Request) -> web.Response:
-        return web.Response(text="AUTONOMA HCS SCANNER ACTIVE", status=200, content_type="text/plain")
-
-    web_app.router.add_get("/", handle_health_check)
-    web_app.router.add_get("/health", handle_health_check)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    application.bot_data["web_runner"] = runner
-    logger.info(f"🌐 Render Health Check HTTP server running on port {PORT}")
+    logger.info("Initialized shared aiohttp ClientSession")
 
 
 async def post_shutdown(application: Application) -> None:
     """
     Lifecycle hook called when Telegram Application shuts down.
-    Cleans up persistent ClientSession and aiohttp web server runner.
+    Cleans up persistent ClientSession.
     """
     session: Optional[ClientSession] = application.bot_data.get("http_session")
     if session and not session.closed:
         await session.close()
         logger.info("Closed aiohttp ClientSession")
 
-    runner: Optional[web.AppRunner] = application.bot_data.get("web_runner")
-    if runner:
-        await runner.cleanup()
-        logger.info("Cleaned up web server runner")
-
 # ------------------------------------------------------------------------------
 # MAIN EXECUTION
 # ------------------------------------------------------------------------------
 def main():
-    logger.info("🛡️ Starting AUTONOMA HCS Scanner Engine...")
-    
+    logger.info("🤖 Autonoma HCS Sentinel Bot v1.5 is starting...")
+
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable is not set!")
         sys.exit(1)
 
+    # 1. Start Render HTTP Health Check server in background daemon thread
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+    # 2. Build Telegram Application with robust extended network timeouts
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
 
-    # Register command handlers
+    # 3. Register command handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("help", help_handler))
     application.add_handler(CommandHandler("scan", scan_handler))
-    
-    # Register global error handler
+
+    # 4. Register global error handler
     application.add_error_handler(global_error_handler)
 
-    # Start non-blocking Telegram long polling loop
+    # 5. Start robust Telegram polling loop with auto-retry on network glitches
     logger.info("Bot starting polling loop...")
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling(
+        poll_interval=1.0,
+        timeout=20,
+        drop_pending_updates=True,
+        allowed_updates=["message", "edited_message"]
+    )
 
 
 if __name__ == "__main__":
