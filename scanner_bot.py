@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 
 from aiohttp import web, ClientSession, ClientTimeout, ClientError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,7 +39,7 @@ RPC_ENDPOINTS: List[str] = [
 ]
 
 # Known DEX Pool programs, authorities, and vault addresses to filter from Top 10 Holders
-KNOWN_LP_OWNERS = {
+KNOWN_LP_OWNERS: Set[str] = {
     "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # Raydium Authority V4
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium Pool V4
     "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
@@ -54,16 +54,77 @@ KNOWN_LP_OWNERS = {
 }
 
 # ------------------------------------------------------------------------------
-# ASYNC SOLANA RPC & DEXSCREENER DATA ENGINE
+# DUAL-LOOKUP PIPELINE: DEXSCREENER & SOLANA RPC
 # ------------------------------------------------------------------------------
-async def fetch_token_largest_accounts(session: ClientSession, mint_address: str, total_supply_raw: int) -> Optional[float]:
+async def fetch_dexscreener_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
+    """
+    Asynchronously queries DexScreener API for token market details:
+    name, symbol, priceUsd, marketCap, pairAddress, and pair_url.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address.strip()}"
+    headers = {"User-Agent": "AutonomaHcsBot/1.0"}
+    timeout = ClientTimeout(total=RPC_TIMEOUT_SECONDS)
+
+    try:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                pairs = data.get("pairs")
+                if pairs and isinstance(pairs, list) and len(pairs) > 0:
+                    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                    target_pairs = solana_pairs if solana_pairs else pairs
+                    best_pair = max(
+                        target_pairs,
+                        key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0)
+                    )
+                    base_token = best_pair.get("baseToken", {})
+                    price_usd = best_pair.get("priceUsd")
+                    fdv = best_pair.get("fdv")
+                    market_cap = best_pair.get("marketCap")
+                    pair_address = best_pair.get("pairAddress")
+                    pair_url = best_pair.get("url")
+
+                    return {
+                        "found": True,
+                        "name": base_token.get("name"),
+                        "symbol": base_token.get("symbol"),
+                        "price_usd": price_usd,
+                        "market_cap": market_cap or fdv,
+                        "pair_address": pair_address,
+                        "pair_url": pair_url
+                    }
+    except Exception as e:
+        logger.warning(f"DexScreener API fetch warning: {e}")
+
+    return {
+        "found": False,
+        "name": None,
+        "symbol": None,
+        "price_usd": None,
+        "market_cap": None,
+        "pair_address": None,
+        "pair_url": None
+    }
+
+
+async def fetch_token_largest_accounts(
+    session: ClientSession,
+    mint_address: str,
+    total_supply_raw: int,
+    dex_pair_address: Optional[str] = None
+) -> Optional[float]:
     """
     Calls getTokenLargestAccounts to retrieve largest token accounts,
-    filters out known Raydium/Orca/Pump.fun LP pools, and calculates
-    the percentage of circulating supply held by Top 10 non-LP wallets.
+    filters out DexScreener pairAddress and known Raydium/Orca/Pump.fun LP pools,
+    and calculates top 10 non-LP concentration against total supply:
+      top10_pct = (top_10_non_lp_sum / total_supply) * 100
     """
     if total_supply_raw <= 0:
         return None
+
+    lp_filter_set = set(KNOWN_LP_OWNERS)
+    if dex_pair_address:
+        lp_filter_set.add(dex_pair_address.strip())
 
     payload = {
         "jsonrpc": "2.0",
@@ -130,7 +191,7 @@ async def fetch_token_largest_accounts(session: ClientSession, mint_address: str
                             for idx, acc_info in enumerate(multi_val):
                                 addr, amt = candidate_addresses[idx]
                                 is_lp = False
-                                if addr in KNOWN_LP_OWNERS:
+                                if addr in lp_filter_set:
                                     is_lp = True
                                 elif acc_info and isinstance(acc_info, dict):
                                     owner = acc_info.get("owner", "")
@@ -140,15 +201,15 @@ async def fetch_token_largest_accounts(session: ClientSession, mint_address: str
                                         .get("info", {})
                                         .get("owner", "")
                                     )
-                                    if owner in KNOWN_LP_OWNERS or parsed_owner in KNOWN_LP_OWNERS:
+                                    if owner in lp_filter_set or parsed_owner in lp_filter_set:
                                         is_lp = True
 
                                 if not is_lp:
                                     non_lp_amounts.append(amt)
                         else:
-                            non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in KNOWN_LP_OWNERS]
+                            non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in lp_filter_set]
                 except Exception:
-                    non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in KNOWN_LP_OWNERS]
+                    non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in lp_filter_set]
 
                 top10_sum = sum(non_lp_amounts[:10])
                 pct = (top10_sum / float(total_supply_raw)) * 100.0
@@ -161,11 +222,15 @@ async def fetch_token_largest_accounts(session: ClientSession, mint_address: str
     return None
 
 
-async def fetch_token_account_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
+async def fetch_token_account_info(
+    session: ClientSession,
+    mint_address: str,
+    dex_pair_address: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Asynchronously queries Solana getAccountInfo using aiohttp with aggressive timeout
     (max 3.0 seconds per node) and automatic RPC node fallback chaining.
-    Also fetches getTokenLargestAccounts to audit Privileged Inventory / Top 10 Holders.
+    Also calls fetch_token_largest_accounts for Top 10 Non-LP concentration.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -239,8 +304,12 @@ async def fetch_token_account_info(session: ClientSession, mint_address: str) ->
                 except (ValueError, TypeError):
                     total_supply_raw = 0
 
-                # Asynchronously audit Top 10 Holders / Inventory Concentration
-                top10_pct = await fetch_token_largest_accounts(session, mint_address, total_supply_raw)
+                top10_pct = await fetch_token_largest_accounts(
+                    session,
+                    mint_address,
+                    total_supply_raw,
+                    dex_pair_address
+                )
 
                 return {
                     "success": True,
@@ -266,58 +335,36 @@ async def fetch_token_account_info(session: ClientSession, mint_address: str) ->
         "error": "Solana RPC requests timed out or failed across all fallback nodes."
     }
 
-
-async def fetch_dexscreener_info(session: ClientSession, mint_address: str) -> Dict[str, Any]:
+# ------------------------------------------------------------------------------
+# FORMATTERS & HCS SCORING LOGIC
+# ------------------------------------------------------------------------------
+def format_price(val: Any) -> str:
     """
-    Asynchronously queries DexScreener API for token price, FDV/market cap, 24h change, and pair URL.
+    Price Formatter matching HCS v1.5 frontend:
+    - If price >= $0.01: displays 3 decimal places (e.g. $0.145).
+    - If price < $0.01: displays full decimal without scientific notation (e.g. $0.00000276).
     """
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address.strip()}"
-    headers = {"User-Agent": "AutonomaHcsBot/1.0"}
-    timeout = ClientTimeout(total=RPC_TIMEOUT_SECONDS)
-
+    if val is None:
+        return "N/A"
     try:
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                pairs = data.get("pairs")
-                if pairs and isinstance(pairs, list) and len(pairs) > 0:
-                    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-                    target_pairs = solana_pairs if solana_pairs else pairs
-                    best_pair = max(
-                        target_pairs,
-                        key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0)
-                    )
-                    base_token = best_pair.get("baseToken", {})
-                    price_usd = best_pair.get("priceUsd")
-                    fdv = best_pair.get("fdv")
-                    market_cap = best_pair.get("marketCap")
-                    price_change_24h = best_pair.get("priceChange", {}).get("h24")
-                    pair_url = best_pair.get("url")
+        v = float(val)
+    except (ValueError, TypeError):
+        return "N/A"
 
-                    return {
-                        "found": True,
-                        "name": base_token.get("name"),
-                        "symbol": base_token.get("symbol"),
-                        "price_usd": price_usd,
-                        "fdv": fdv or market_cap,
-                        "price_change_24h": price_change_24h,
-                        "pair_url": pair_url
-                    }
-    except Exception as e:
-        logger.warning(f"DexScreener API fetch warning: {e}")
-
-    return {
-        "found": False,
-        "name": None,
-        "symbol": None,
-        "price_usd": None,
-        "fdv": None,
-        "price_change_24h": None,
-        "pair_url": None
-    }
+    if v >= 0.01:
+        return f"${v:.3f}"
+    elif v > 0:
+        s = f"{v:.10f}".rstrip("0")
+        if s.endswith("."):
+            s += "00"
+        return f"${s}"
+    return "$0.000"
 
 
 def format_market_cap(val: Any) -> str:
+    """
+    Market Cap Formatter matching HCS v1.5 frontend.
+    """
     if val is None:
         return "N/A"
     try:
@@ -335,44 +382,13 @@ def format_market_cap(val: Any) -> str:
         return f"${v:.2f}"
 
 
-def format_price(val: Any) -> str:
-    if val is None:
-        return "N/A"
-    try:
-        v = float(val)
-    except (ValueError, TypeError):
-        return "N/A"
-
-    if v >= 1.0:
-        return f"${v:.2f}"
-    elif v >= 0.01:
-        return f"${v:.4f}"
-    elif v > 0:
-        s = f"${v:.8f}".rstrip("0")
-        return s if not s.endswith(".") else s + "00"
-    return "$0.00"
-
-
-def format_price_change(val: Any) -> str:
-    if val is None:
-        return "N/A"
-    try:
-        v = float(val)
-    except (ValueError, TypeError):
-        return "N/A"
-
-    if v > 0:
-        return f"+{v:.2f}% 📈"
-    elif v < 0:
-        return f"{v:.2f}% 📉"
-    else:
-        return "0.00% ➡️"
-
-
 def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str, Any]) -> str:
     """
-    Formats the HCS Audit Report with DexScreener metrics, Top 10 Inventory Concentration,
-    and HCS Grade & Verdict as clean HTML for Telegram display.
+    Formats the HCS v1.5 Telemetry Audit Report matching autonomaprotocol.io:
+    - Dual-lookup pipeline results (DexScreener + Solana RPC)
+    - Established market cap threshold ($10M)
+    - 4-tier Grade & Verdict scoring logic
+    - Exact price formatting & holder concentration labels
     """
     if not audit_res.get("found"):
         err_msg = audit_res.get("error", "Address not found on Mainnet-Beta or invalid CA.")
@@ -397,67 +413,67 @@ def generate_audit_report(ca: str, audit_res: Dict[str, Any], dex_res: Dict[str,
         token_title = "Unlisted / Pre-Launch"
 
     price_str = format_price(dex_res.get("price_usd"))
-    mc_str = format_market_cap(dex_res.get("fdv"))
-    change_str = format_price_change(dex_res.get("price_change_24h"))
-
+    mcap_val = dex_res.get("market_cap")
+    mc_str = format_market_cap(mcap_val)
     program_type = "Token-2022" if is_token_2022 else "Legacy SPL"
 
     mint_status = "✅ REVOKED (0 Expansion)" if mint_clean else "❌ RETAINED (Inflation Risk)"
     freeze_status = "✅ REVOKED (Permissionless)" if freeze_clean else "❌ RETAINED (Blacklist Risk)"
 
-    # Format Top 10 Holders Concentration Status
-    if top10_pct is not None:
-        if top10_pct > 20.0:
-            holders_status = f"⚠️ {top10_pct:.1f}% (High Dump Risk)"
-        else:
-            holders_status = f"✅ {top10_pct:.1f}% (Distributed)"
-    else:
-        holders_status = "ℹ️ N/A"
+    # Determine if token is established (Market Cap > $10,000,000)
+    is_established = False
+    if mcap_val is not None:
+        try:
+            is_established = (float(mcap_val) > 10_000_000.0)
+        except (ValueError, TypeError):
+            is_established = False
 
-    # Determine HCS Grade & Safety Verdict based on Authorities + Inventory Concentration
+    warning_block = ""
+
+    # HCS v1.5 Scoring & Verdict Matrix
     if not authorities_clean:
-        grade_str = "⚠️ <b>GRADE: D- (CENTRALIZED RISK)</b>"
+        grade_str = "⚠️ <b>GRADE: D- (HIGH CENTRALIZATION RISK)</b>"
         verdict_str = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
-        explanation = (
-            "<b>🔴 CRITICAL RISKS DETECTED:</b>\n"
-            "• <b>Dilution / Blacklist Hazard:</b> Surviving founder permissions allow supply alteration or wallet freezing."
-        )
-    elif top10_pct is not None and top10_pct > 20.0:
+        warning_block = "\n⚠️ <i>Administrative backdoor retained by creator.</i>"
+        if top10_pct is not None:
+            holder_label = f"{top10_pct:.1f}%"
+        else:
+            holder_label = "N/A"
+    elif is_established and top10_pct is not None and top10_pct > 45.0:
+        grade_str = "🏆 <b>GRADE: A (ESTABLISHED / CEX DEPTH)</b>"
+        verdict_str = "🟢 <b>INSTITUTIONAL SOVEREIGNTY</b>"
+        holder_label = f"{top10_pct:.1f}% (Exchange & Custody Depth)"
+    elif not is_established and top10_pct is not None and top10_pct > 55.0:
         grade_str = "⚠️ <b>GRADE: C- (CABAL CONCENTRATION RISK)</b>"
-        verdict_str = "🔴 <b>DISCRETIONARY RISK DETECTED</b>"
-        explanation = (
-            "<b>⚠️ CABAL CONCENTRATION RISK DETECTED:</b>\n"
-            "• <b>High Insider Control:</b> Top 10 non-LP wallets control > 20% of circulating supply, creating severe dump and price manipulation hazard."
-        )
+        verdict_str = "⚠️ <b>CABAL CONCENTRATION DETECTED</b>"
+        holder_label = f"{top10_pct:.1f}% (Cabal Risk >55%)"
     else:
-        grade_str = "🏆 <b>GRADE: A+ (IMMUTABLE & DECENTRALIZED)</b>"
+        grade_str = "🏆 <b>GRADE: A+ (IMMUTABLE & DISTRIBUTED)</b>"
         verdict_str = "🟢 <b>ZERO HUMAN CONTROL (0% HCS)</b>"
-        explanation = (
-            "<b>🟢 WHY THIS IS SAFE:</b>\n"
-            "• <b>Zero Dilution:</b> Supply is locked forever. No dev can inflate or dump new tokens.\n"
-            "• <b>100% Sovereign:</b> Nobody owns a master freeze key. Wallets cannot be blacklisted or locked."
-        )
+        if top10_pct is not None:
+            holder_label = f"{top10_pct:.1f}% (Healthy Distribution)"
+        else:
+            holder_label = "N/A"
 
     report = (
-        f"🛡️ <b>AUTONOMA HCS RUNTIME REPORT</b>\n"
+        f"🛡️ <b>AUTONOMA HCS RUNTIME TELEMETRY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Token:</b> {token_title}\n"
-        f"<b>Target CA:</b> <code>{ca}</code>\n"
+        f"<b>Mint CA:</b> <code>{ca}</code>\n"
         f"<b>Program:</b> {program_type}\n\n"
-        f"📊 <b>MARKET METRICS:</b>\n"
+        f"📊 <b>MARKET TELEMETRY:</b>\n"
         f"• <b>Price:</b> {price_str}\n"
-        f"• <b>FDV / Market Cap:</b> {mc_str}\n"
-        f"• <b>24h Change:</b> {change_str}\n\n"
-        f"🔒 <b>AUTHORITY & INVENTORY STATUS:</b>\n"
+        f"• <b>Market Cap:</b> {mc_str}\n\n"
+        f"🔒 <b>SECURITY TELEMETRY:</b>\n"
         f"• <b>Mint Authority:</b> {mint_status}\n"
         f"• <b>Freeze Authority:</b> {freeze_status}\n"
-        f"• <b>Top 10 Holders:</b> {holders_status}\n"
+        f"• <b>Top 10 Non-LP:</b> {holder_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{grade_str}\n"
-        f"<b>VERDICT:</b> {verdict_str}\n\n"
-        f"{explanation}\n"
+        f"<b>VERDICT:</b> {verdict_str}"
+        f"{warning_block}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Audited via AUTONOMA Protocol // autonomaprotocol.io</i>"
+        f"🌐 <i>Inspect on Terminal: autonomaprotocol.io</i>"
     )
     return report
 
@@ -520,7 +536,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Step 1: Send instant status message to notify user immediately
         status_msg = await update.message.reply_text(
-            "🔍 <i>Auditing Human Control Surface & Top 10 Inventory...</i>",
+            "🔍 <i>Auditing Human Control Surface & Telemetry...</i>",
             parse_mode="HTML"
         )
 
@@ -532,12 +548,12 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             created_temp_session = True
 
         try:
-            # Step 3: Concurrently fetch Solana RPC account info & DexScreener token market metrics
-            audit_result, dex_result = await asyncio.gather(
-                fetch_token_account_info(session, ca),
-                fetch_dexscreener_info(session, ca),
-                return_exceptions=True
-            )
+            # Step 3a: Fetch DexScreener market info first to get pairAddress
+            dex_result = await fetch_dexscreener_info(session, ca)
+            dex_pair_addr = dex_result.get("pair_address") if isinstance(dex_result, dict) else None
+
+            # Step 3b: Fetch Solana RPC account info with dex_pair_addr filtering
+            audit_result = await fetch_token_account_info(session, ca, dex_pair_address=dex_pair_addr)
         finally:
             if created_temp_session:
                 await session.close()
