@@ -121,7 +121,7 @@ async def fetch_dexscreener_info(session: ClientSession, mint_address: str) -> D
                         "pair_url": pair_url
                     }
     except Exception as e:
-        logger.warning(f"DexScreener API fetch warning: {e}")
+        logger.warning(f"[HCS DEXSCREENER WARNING] API fetch warning: {e}")
 
     return {
         "found": False,
@@ -145,8 +145,10 @@ async def fetch_token_largest_accounts(
     filters out DexScreener pairAddress and known Raydium/Orca/Pump.fun LP pools,
     and calculates top 10 non-LP concentration against total supply:
       top10_pct = (top_10_non_lp_sum / total_supply) * 100
+    Includes detailed diagnostic logging for all RPC steps.
     """
     if total_supply_raw <= 0:
+        logger.warning(f"[HCS HOLDER AUDIT] Invalid total_supply_raw: {total_supply_raw} for mint {mint_address}")
         return None
 
     lp_filter_set = set(KNOWN_LP_OWNERS)
@@ -172,29 +174,49 @@ async def fetch_token_largest_accounts(
 
     for endpoint in endpoints:
         try:
+            logger.debug(f"[HCS HOLDER AUDIT] Querying getTokenLargestAccounts on: {endpoint}")
             async with session.post(endpoint, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
+                    body_text = await resp.text()
+                    logger.warning(f"[HCS AUDIT RPC WARNING] Endpoint {endpoint} returned HTTP {resp.status}: {body_text[:150]}")
                     continue
 
                 data = await resp.json()
-                if not data or "result" not in data:
+                if not data or not isinstance(data, dict):
+                    logger.warning(f"[HCS AUDIT RPC WARNING] Endpoint {endpoint} returned empty response")
                     continue
 
-                value = data["result"].get("value")
+                if "error" in data:
+                    logger.warning(f"[HCS AUDIT RPC ERROR] Endpoint {endpoint} JSON-RPC error: {data.get('error')}")
+                    continue
+
+                result = data.get("result", {})
+                value = result.get("value")
                 if not isinstance(value, list) or len(value) == 0:
+                    logger.warning(f"[HCS AUDIT RPC WARNING] Endpoint {endpoint} returned empty result.value list")
                     continue
 
                 candidate_addresses = []
-                for item in value:
+                for idx, item in enumerate(value):
+                    if not isinstance(item, dict):
+                        continue
                     addr = item.get("address")
+                    amount_val = item.get("amount")
                     try:
-                        amount = int(item.get("amount", 0))
-                    except (ValueError, TypeError):
+                        if amount_val is not None:
+                            amount = int(amount_val)
+                        else:
+                            ui_amt = item.get("uiAmount")
+                            amount = int(float(ui_amt)) if ui_amt is not None else 0
+                    except (ValueError, TypeError) as parse_err:
+                        logger.warning(f"[HCS AUDIT PARSE WARNING] Item {idx} amount parse error: {parse_err}")
                         amount = 0
+
                     if addr and amount > 0:
                         candidate_addresses.append((addr, amount))
 
                 if not candidate_addresses:
+                    logger.warning(f"[HCS AUDIT WARNING] Endpoint {endpoint} yielded 0 valid candidate addresses")
                     continue
 
                 # Batch inspect account owners using getMultipleAccounts
@@ -214,7 +236,7 @@ async def fetch_token_largest_accounts(
                     async with session.post(endpoint, json=multi_payload, headers=headers, timeout=timeout) as multi_resp:
                         if multi_resp.status == 200:
                             multi_data = await multi_resp.json()
-                            multi_val = multi_data.get("result", {}).get("value", [])
+                            multi_val = multi_data.get("result", {}).get("value", []) if isinstance(multi_data, dict) else []
                             for idx, acc_info in enumerate(multi_val):
                                 addr, amt = candidate_addresses[idx]
                                 is_lp = False
@@ -222,30 +244,37 @@ async def fetch_token_largest_accounts(
                                     is_lp = True
                                 elif acc_info and isinstance(acc_info, dict):
                                     owner = acc_info.get("owner", "")
-                                    parsed_owner = (
-                                        acc_info.get("data", {})
-                                        .get("parsed", {})
-                                        .get("info", {})
-                                        .get("owner", "")
+                                    data_field = acc_info.get("data")
+                                    parsed_info = (
+                                        data_field.get("parsed", {}).get("info", {})
+                                        if isinstance(data_field, dict) else {}
                                     )
+                                    parsed_owner = parsed_info.get("owner", "") if isinstance(parsed_info, dict) else ""
                                     if owner in lp_filter_set or parsed_owner in lp_filter_set:
                                         is_lp = True
 
                                 if not is_lp:
                                     non_lp_amounts.append(amt)
                         else:
+                            logger.warning(f"[HCS AUDIT WARNING] getMultipleAccounts status {multi_resp.status} on {endpoint}")
                             non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in lp_filter_set]
-                except Exception:
+                except Exception as multi_exc:
+                    logger.warning(f"[HCS AUDIT EXCEPTION] getMultipleAccounts failed on {endpoint}: {repr(multi_exc)}")
                     non_lp_amounts = [amt for addr, amt in candidate_addresses if addr not in lp_filter_set]
 
                 top10_sum = sum(non_lp_amounts[:10])
                 pct = (top10_sum / float(total_supply_raw)) * 100.0
+                logger.info(f"[HCS AUDIT SUCCESS] Calculated Top 10 Non-LP concentration: {pct:.1f}% via {endpoint}")
                 return round(pct, 1)
 
+        except (asyncio.TimeoutError, ClientError) as e:
+            logger.warning(f"[HCS AUDIT TIMEOUT/NETWORK] Endpoint {endpoint} failed: {repr(e)}")
+            continue
         except Exception as e:
-            logger.warning(f"getTokenLargestAccounts warning for endpoint {endpoint}: {e}")
+            logger.error(f"[HCS AUDIT EXCEPTION] Endpoint {endpoint} error: {repr(e)}", exc_info=True)
             continue
 
+    logger.warning(f"[HCS AUDIT FAILED] All RPC endpoints failed or were rate-limited for mint {mint_address}")
     return None
 
 
@@ -281,15 +310,20 @@ async def fetch_token_account_info(
 
     for endpoint in endpoints:
         try:
-            logger.debug(f"Querying RPC node: {endpoint}")
+            logger.debug(f"[HCS AUDIT RPC] Querying getAccountInfo on: {endpoint}")
             async with session.post(endpoint, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
-                    logger.warning(f"RPC {endpoint} returned HTTP status {resp.status}")
+                    body_text = await resp.text()
+                    logger.warning(f"[HCS AUDIT RPC WARNING] getAccountInfo {endpoint} HTTP status {resp.status}: {body_text[:150]}")
                     continue
 
                 data = await resp.json()
-                if not data or "result" not in data:
-                    logger.warning(f"RPC {endpoint} returned unexpected body format")
+                if not data or not isinstance(data, dict):
+                    logger.warning(f"[HCS AUDIT RPC WARNING] getAccountInfo {endpoint} invalid response body")
+                    continue
+
+                if "error" in data:
+                    logger.warning(f"[HCS AUDIT RPC ERROR] getAccountInfo {endpoint} JSON-RPC error: {data.get('error')}")
                     continue
 
                 result = data.get("result", {})
@@ -350,10 +384,10 @@ async def fetch_token_account_info(
                 }
 
         except (asyncio.TimeoutError, ClientError) as e:
-            logger.warning(f"RPC {endpoint} timeout or network error: {e}")
+            logger.warning(f"[HCS AUDIT TIMEOUT/NETWORK] getAccountInfo {endpoint} failed: {repr(e)}")
             continue
         except Exception as e:
-            logger.warning(f"RPC {endpoint} unexpected exception: {e}")
+            logger.error(f"[HCS AUDIT EXCEPTION] getAccountInfo {endpoint} unexpected error: {repr(e)}", exc_info=True)
             continue
 
     return {
